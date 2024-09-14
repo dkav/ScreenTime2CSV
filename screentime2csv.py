@@ -1,36 +1,56 @@
-import os
-import sqlite3
+"""Exporting Apple Screen Time to CSV.
+
+Modified from:
+https://github.com/FelixKohlhas/ScreenTime2CSV
+
+"""
+
 import argparse
 import csv
+import os
+import sqlite3
+import sys
 from io import StringIO
+from pathlib import Path
 
-knowledge_db = os.path.expanduser("~/Library/Application Support/Knowledge/knowledgeC.db")
+
+HEADER = ["app", "start_time", "end_time", "duration_seconds",
+         "created_time_coca", "device_id", "device_model"]
+
 
 def query_database(last_created_at):
+    """Query knowledgeC database."""
+    knowledge_db = Path(
+        "~/Library/Application Support/Knowledge/knowledgeC.db").expanduser()
+
     # Check if knowledgeC.db exists
-    if not os.path.exists(knowledge_db):
-        print("Could not find knowledgeC.db at %s." % (knowledge_db))
-        exit(1)
+    if not knowledge_db.exists():
+        print(f"Could not find knowledgeC.db at {knowledge_db}.")
+        sys.exit(1)
 
     # Check if knowledgeC.db is readable
     if not os.access(knowledge_db, os.R_OK):
-        print("The knowledgeC.db at %s is not readable.\nPlease grant full disk access to the application running the script (e.g. Terminal, iTerm, VSCode etc.)." % (knowledge_db))
-        exit(1)
+        print(f"The knowledgeC.db at {knowledge_db} is not readable.\n"
+              "Please grant full  disk access to the application running the "
+              "script (e.g. Terminal, iTerm, VSCode etc.).")
+        sys.exit(1)
 
     # Connect to the SQLite database
     with sqlite3.connect(knowledge_db) as con:
         cur = con.cursor()
 
         # Execute the SQL query to fetch data
-        # Modified from https://rud.is/b/2019/10/28/spelunking-macos-screentime-app-usage-with-r/
+        # Modified from:
+        # https://rud.is/b/2019/10/28/spelunking-macos-screentime-app-usage-with-r/
         query = """
         SELECT
             ZOBJECT.ZVALUESTRING AS "app",
-            (ZOBJECT.ZENDDATE - ZOBJECT.ZSTARTDATE) AS "usage",
-            (ZOBJECT.ZSTARTDATE + 978307200) as "start_time",
-            (ZOBJECT.ZENDDATE + 978307200) as "end_time",
-            (ZOBJECT.ZCREATIONDATE + 978307200) as "created_at",
-            ZOBJECT.ZSECONDSFROMGMT AS "tz",
+            DATETIME(ZOBJECT.ZSTARTDATE + 978307200 +
+                ZOBJECT.ZSECONDSFROMGMT,'unixepoch') AS "start",
+            DATETIME(ZOBJECT.ZENDDATE + 978307200 +
+                ZOBJECT.ZSECONDSFROMGMT,'unixepoch') AS "end",
+            ZOBJECT.ZENDDATE - ZOBJECT.ZSTARTDATE AS "duration",
+            ZOBJECT.ZCREATIONDATE as "creation",
             ZSOURCE.ZDEVICEID AS "device_id",
             ZMODEL AS "device_model"
         FROM
@@ -46,7 +66,7 @@ def query_database(last_created_at):
             ON ZSOURCE.ZDEVICEID = ZSYNCPEER.ZDEVICEID
         WHERE
             ZSTREAMNAME = "/app/usage" AND
-            (ZOBJECT.ZCREATIONDATE + 978307200) > ?
+            ZOBJECT.ZCREATIONDATE > ?
         ORDER BY
             ZCREATIONDATE DESC
         """
@@ -55,48 +75,56 @@ def query_database(last_created_at):
         # Fetch all rows from the result set
         return cur.fetchall()
 
-def write_to_csv(rows, output, delimiter):
-    writer = csv.writer(output, delimiter=delimiter, quoting=csv.QUOTE_MINIMAL)
-    writer.writerow(["app", "usage", "start_time", "end_time", "created_at", "tz", "device_id", "device_model"])
-    writer.writerows(rows)
+
+def write_to_csv(output, delimiter):
+    """Write Screen Time date to csv file."""
+    if not Path(output).exists():
+        st_data = query_database(0.0)
+        with open(output, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f, delimiter=delimiter, quoting=csv.QUOTE_MINIMAL)
+            writer.writerow(HEADER)
+            writer.writerows(st_data)
+    else:
+        with open(output, newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            next(reader, None)
+            old_st_data = list(reader)
+        st_data = query_database(old_st_data[0][4])
+        with open(output, "w", newline="", encoding="utf-8") as f_new:
+            writer = csv.writer(f_new, delimiter=delimiter, quoting=csv.QUOTE_MINIMAL)
+            writer.writerow(HEADER)
+            writer.writerows(st_data)
+            writer.writerows(old_st_data)
+
+
+def csv_to_stringio(delimiter):
+    """Create StringIO csv object."""
+    st_data = query_database(0.0)
+    stringio_obj = StringIO()
+    writer = csv.writer(stringio_obj, delimiter=delimiter, quoting=csv.QUOTE_MINIMAL)
+    writer.writerow(HEADER)
+    writer.writerows(st_data)
+    return stringio_obj
+
 
 def main():
+    """Main function for screentime2csv."""
     parser = argparse.ArgumentParser(description="Query knowledge database")
-    parser.add_argument("-o", "--output", help="Output file path (default: stdout)")
-    parser.add_argument("-d", "--delimiter", default=',', help="Delimiter for output file (default: comma)")
+    parser.add_argument(
+        "-o", "--output", help="Output file path (default: stdout)")
+    parser.add_argument("-d", "--delimiter", default=",",
+                        help="Delimiter for output file (default: comma)")
     args = parser.parse_args()
 
     # Prepare output format
     delimiter = args.delimiter.replace("\\t", "\t")
 
-    # Check if file exists to decide whether to write headers
-    file_exists = os.path.isfile(args.output)
-    last_created_at_file = args.output + ".last"
-    if os.path.isfile(last_created_at_file):
-        with open(last_created_at_file, "r") as f:
-            last_created_at = float(f.read().strip())
-    else:
-        last_created_at = 0.0
-
-    # Query the database and fetch the rows
-    rows = query_database(last_created_at)
-
-    # Update the last created at time
-    if rows:
-        with open(last_created_at_file, "w") as f:
-            f.write(str(rows[0][4]))  # rows[0][4] is the "created_at" of the first row
-
-    # Write the output to a file or print to stdout
     if args.output:
-        with open(args.output, "a", newline='') as f:
-            writer = csv.writer(f, delimiter=delimiter, quoting=csv.QUOTE_MINIMAL)
-            if not file_exists:
-                writer.writerow(["app", "usage", "start_time", "end_time", "created_at", "tz", "device_id", "device_model"])
-            writer.writerows(rows)
+        write_to_csv(args.output, delimiter)
     else:
-        output = StringIO()
-        write_to_csv(rows, output, delimiter)
-        print(output.getvalue())
+        csv_output = csv_to_stringio(delimiter)
+        print(csv_output.getvalue())
+
 
 if __name__ == "__main__":
     main()
